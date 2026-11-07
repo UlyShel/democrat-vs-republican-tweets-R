@@ -1,0 +1,360 @@
+---
+title: "final_project"
+author: "Pavlenko, Shevchenko, Shelegova BPS-222"
+date: "2025-10-28"
+output: html_document
+---
+
+```{r}
+library(tm)
+library(dplyr)
+library(SnowballC)
+library(tidytext)
+library(caret)
+library(rsample)
+library(textrecipes)
+library(stopwords)
+
+library(ROCR)
+library(PRROC)
+library(modeldata)
+library(corrr)
+```
+
+```{r}
+library(here)
+
+dir.create(
+  "../results/figures",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+
+```{r}
+tweets <- read.csv("../data/ExtractedTweets.csv", stringsAsFactors = FALSE)
+tweets <- tweets %>% select(Party, Tweet)
+```
+
+```{r}
+str(tweets)
+```
+
+```{r}
+sum(is.na(tweets))
+```
+
+```{r}
+tweets <- tweets %>% 
+  mutate(Party = case_when(
+            Party == "Democrat" ~ 1,
+            Party == "Republican" ~ 0)) %>% 
+  mutate(Party = as.factor(Party))
+```
+
+```{r}
+summary(tweets) # normal balance of classes
+```
+
+```{r}
+set.seed(123)
+splitting <- initial_split(tweets, prop=0.7, strata=Party)
+
+tweets_train <- training(splitting)
+tweets_test <- testing(splitting)
+```
+
+APPROACH 1: TF-IDF as a vectorizer
+```{r}
+# https://www.rdocumentation.org/packages/textrecipes/versions/0.2.3
+# https://cran.r-project.org/web/packages/textrecipes/textrecipes.pdf
+
+# First, we create the recipe to clean and transform tweets into vectors 
+
+recipe_1 <- recipe(Party ~ Tweet, data = tweets_train) %>% 
+  step_text_normalization(Tweet) %>% # text standartization
+  step_tokenize(Tweet) %>% # splitting text into tokens              
+  step_stopwords(Tweet) %>%  # deleting stopwords (useless ones)          
+  step_stem(Tweet) %>% # stemmatization = only roots from words     
+  step_tokenfilter(Tweet, min_times = 20, max_tokens=500) %>% # removing noise + preventing RAM explosion
+  # WHY? ->  https://cran.r-project.org/web/packages/textrecipes/textrecipes.pdf -> based on this article:  step_tokenfilter is a good strategy is to start with a low token count and go up according to how much RAM you want to use.
+  # It is strongly advised to filter before using step_tf or step_tfidf to limit the number of variables created.
+  step_tfidf(Tweet) # tf-idf as a method of vectorization
+```
+
+```{r}
+set.seed(123)
+
+# preparing and applying recipe
+
+rec1_prep <- prep(recipe_1, training = tweets_train)
+
+train_tweets1 <- bake(rec1_prep, new_data = tweets_train)
+
+# Before training the models, we build logistic regressions using the formulas we included in the recipes, as we've done in HW-3
+
+model_glm <- glm(Party ~ ., data = train_tweets1, family = "binomial") # logistic regression model with two classes (Republican / Democrat)
+```
+
+
+```{r}
+test_tweets1  <- bake(rec1_prep, new_data = tweets_test)
+
+# prediction
+pred_train_1 <- predict(model_glm, newdata = train_tweets1, type = "response")
+pred_test_1 <- predict(model_glm, newdata = test_tweets1, type = "response")
+```
+
+```{r}
+# converting probabilities to class labels BECAUSE of these errors -> 
+pred_train_1 <- ifelse(pred_train_1 > 0.5, 1, 0) # Error in confusionMatrix.default(data = relevel(pred_train_1, ref = "1"),  : the data cannot have more levels than the reference
+pred_train_1 <- as.factor(pred_train_1) # Error in relevel.default(pred_train_1, ref = "1") : 'relevel' only for (unordered) factors
+```
+
+```{r}
+summary(model_glm)
+# In general, people who use words such as: access, afford, bring, children, class, clear, cost are more likely to be Democrats
+# While words (back, bill, benefit, border, business, capital) are associated with Republicans. 
+```
+
+```{r}
+cv1 <- train(
+  recipe_1,
+  data = tweets_train,
+  method = "glm",
+  family = "binomial",
+  trControl = trainControl(method = "cv", number = 3) # only 3-fold cv because otherwise training was way too long 
+)
+```
+
+```{r}
+# extracting probabilities 
+m1_prob_train <- predict(cv1, tweets_train, type = "prob")$"1"
+m1_prob_test <- predict(cv1, tweets_test, type="prob")$"1"
+```
+
+```{r}
+# ROC curve 
+perf1_train <- prediction(m1_prob_train, tweets_train$Party) %>% 
+  performance(measure = "tpr", x.measure = "fpr")
+
+# plotting performance
+plot(perf1_train, col = "black")
+
+# In terms of FPR and TPR, the model is much better than a random model. However of course, it is not perfect classifiers (0,1). 
+```
+```{r}
+# ROC curve test
+perf1_test <- prediction(m1_prob_test, tweets_test$Party) %>% 
+  performance(measure = "tpr", x.measure = "fpr")
+
+# plotting performance
+plot(perf1_test, col = "black")
+```
+
+
+```{r}
+png(
+  here("results", "figures", "roc_train.png"),
+  width = 1200,
+  height = 900,
+  res = 150
+)
+
+plot(perf1_train, col = "black")
+dev.off()
+```
+
+```{r}
+png(
+  here("results", "figures", "roc_test.png"),
+  width = 1200,
+  height = 900,
+  res = 150
+)
+
+plot(perf1_test, col = "black")
+dev.off()
+```
+
+
+```{r}
+# PR curve 
+PRdata <- data.frame(
+  actual = tweets_train$Party,
+  probabilities = m1_prob_train
+)
+
+pr <- pr.curve(scores.class0 = PRdata$probabilities[PRdata$actual == '1'], # probabilities FOR POSITIVE CLASS
+               scores.class1 = PRdata$probabilities[PRdata$actual == '0'], # probabilities FOR NEGATIVE CLASS
+               curve = T)
+plot(pr)
+# accuracy is quite high (0.72)
+```
+
+```{r}
+png(here("results", "figures", "pr_train.png"),
+    width = 1200, height = 900, res = 150)
+
+plot(pr)
+dev.off()
+```
+
+```{r}
+perf1_test <- prediction(m1_prob_test, tweets_test$Party) %>% 
+  performance(measure = "tpr", x.measure = "fpr")
+
+plot(perf1_test, col = "red")
+```
+
+```{r}
+PRdata <- data.frame(
+  actual = tweets_test$Party,
+  probabilities = m1_prob_test
+)
+
+pr <- pr.curve(scores.class0 = PRdata$probabilities[PRdata$actual == '1'], # probabilities FOR POSITIVE CLASS
+               scores.class1 = PRdata$probabilities[PRdata$actual == '0'], # probabilities FOR NEGATIVE CLASS
+               curve = T)
+plot(pr)
+
+# Since performance is not significantly worse for testing, it might be said that there is no such problem as overfitting and in general the model is successful. 
+```
+
+```{r}
+png(here("results", "figures", "pr_test.png"),
+    width = 1200, height = 900, res = 150)
+
+plot(pr)
+dev.off()
+```
+
+
+
+APPROACH 2:  Embeddings implementation
+```{r}
+library(word2vec)
+```
+
+We will need a custom function for correct execution -->
+```{r}
+# referencees: 
+# https://www.rdocumentation.org/packages/word2vec/versions/0.4.0/topics/word2vec
+# https://www.rdocumentation.org/packages/word2vec/versions/0.4.0/topics/word2vec
+# https://pub.towardsai.net/unlocking-the-potential-of-text-a-closer-look-at-pre-embedding-cleaning-methods-7c44f2d4ec60
+
+get_embeddings <- function(texts, dim = 30) {
+  
+  # Basic text cleaning
+  clean_texts <- sapply(texts, function(x) {
+    if(is.na(x) || nchar(x) == 0) return("")
+    # Removing non-ASCII characters
+    x <- iconv(x, to = "ASCII//TRANSLIT", sub = "")
+    # Removing URLs, mentions, hashtags
+    x <- gsub("http\\S+\\s*", "", x)
+    x <- gsub("@\\w+", "", x)
+    x <- gsub("#\\w+", "", x)
+    # Removing punctuation and digits
+    x <- gsub("[^a-zA-Z\\s]", " ", x)
+    # Converting to lowercase and trim
+    x <- tolower(trimws(x))
+    return(x)
+  })
+  
+  # Removing empty texts and track valid indices
+  non_empty <- nchar(clean_texts) > 0
+  clean_texts <- clean_texts[non_empty]
+  valid_indices <- which(non_empty)
+  
+  if(length(clean_texts) == 0) {
+    return(list(embeddings = matrix(0, nrow = 0, ncol = dim), 
+                valid_indices = integer(0)))
+  }
+  
+  # Writing to temporary file for word2vec
+  temp_file <- tempfile(fileext = ".txt")
+  writeLines(clean_texts, temp_file, useBytes = TRUE)
+  
+  # Training word2vec model
+  model <- word2vec(temp_file, type = "cbow", dim = dim, iter = 5)
+  
+  # Cleaning up
+  unlink(temp_file)
+  
+  # Getting embeddings
+  word_vectors <- as.matrix(model)
+  
+  # Creating document embeddings
+  tokens <- strsplit(clean_texts, "\\s+")
+  doc_embeddings <- t(sapply(tokens, function(doc_words) {
+    valid_words <- doc_words[doc_words %in% rownames(word_vectors)]
+    if(length(valid_words) > 0) {
+      colMeans(word_vectors[valid_words, , drop = FALSE])
+    } else {
+      rep(0, ncol(word_vectors))
+    }
+  }))
+  
+  return(list(embeddings = doc_embeddings, valid_indices = valid_indices))
+}
+```
+
+```{r}
+# Applying word2vec to our data (generating word2vec embeddings)
+set.seed(123)
+
+train_result <- get_embeddings(tweets_train$Tweet, dim = 30)
+test_result <- get_embeddings(tweets_test$Tweet, dim = 30)
+```
+
+```{r}
+# Converting to data frames with proper Party assignment
+train_embeddings_df <- as.data.frame(train_result$embeddings)
+colnames(train_embeddings_df) <- paste0("V", 1:ncol(train_embeddings_df))
+```
+
+```{r}
+# Using valid indices to align Party labels correctly
+train_embeddings_df$Party <- tweets_train$Party[train_result$valid_indices]
+test_embeddings_df <- as.data.frame(test_result$embeddings)
+
+colnames(test_embeddings_df) <- paste0("V", 1:ncol(test_embeddings_df))
+test_embeddings_df$Party <- tweets_test$Party[test_result$valid_indices]
+```
+
+```{r}
+# Training model on embeddings
+model_glm_embeddings <- glm(Party ~ ., data = train_embeddings_df, family = "binomial")
+```
+
+```{r}
+# Making predictions
+pred_train_embeddings <- predict(model_glm_embeddings, newdata = train_embeddings_df, type = "response")
+pred_test_embeddings <- predict(model_glm_embeddings, newdata = test_embeddings_df, type = "response")
+
+pred_train_embeddings_factor <- as.factor(ifelse(pred_train_embeddings > 0.5, 1, 0))
+pred_test_embeddings_factor <- as.factor(ifelse(pred_test_embeddings > 0.5, 1, 0))
+```
+
+
+Model evaluation --> accuracy 0.59 on train and 0.52 on test
+```{r}
+confusionMatrix(
+  data = relevel(pred_train_embeddings_factor, ref = "1"),
+  reference = relevel(train_embeddings_df$Party, ref = "1")
+)
+
+```
+
+```{r}
+confusionMatrix(
+  data = relevel(pred_test_embeddings_factor, ref = "1"),
+  reference = relevel(test_embeddings_df$Party, ref = "1")
+) 
+```
+
+
+
+
+
+
